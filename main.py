@@ -18,10 +18,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-@app.post("/denoise", response_class=FileResponse)
 @app.get("/")
 def root():
     return {"message": "Audio Denoising API is running"}
+
+
+@app.post("/denoise", response_class=FileResponse)
 async def denoise(file: UploadFile = File(...)):
 
     input_filename = f"input_{uuid.uuid4()}.wav"
