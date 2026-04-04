@@ -24,9 +24,17 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 # LOAD MODEL (LOAD ONCE)
 # =============================
 
-bundle = torchaudio.pipelines.HDEMUCS_HIGH_MUSDB_PLUS
-dl_model = bundle.get_model().to(DEVICE)
-dl_model.eval()
+dl_model = None
+
+def get_model():
+    global dl_model
+
+    if dl_model is None:
+        bundle = torchaudio.pipelines.HDEMUCS_HIGH_MUSDB_PLUS
+        dl_model = bundle.get_model().to(DEVICE)
+        dl_model.eval()
+
+    return dl_model
 
 # =============================
 # DSP FUNCTIONS (UNCHANGED)
@@ -85,12 +93,14 @@ def reconstruct(mag, phase, length):
 # =============================
 
 def deep_learning_denoise(signal):
+    model = get_model()
+
     with torch.no_grad():
         x = torch.tensor(signal, dtype=torch.float32)
 
         x = x.unsqueeze(0).unsqueeze(0).repeat(1, 2, 1).to(DEVICE)
 
-        y = dl_model(x)
+        y = model(x)
 
         y = y[0]
         y = y.mean(dim=0) * 0.8
