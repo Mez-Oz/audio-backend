@@ -1,18 +1,18 @@
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import FileResponse
-from fastapi import HTTPException
 import shutil
 import uuid
-import soundfile as sf
 import os
 
-from denoise import denoise_audio, estimate_snr
+from pipeline import denoise_audio   # <-- IMPORTANT (updated import)
 
 app = FastAPI()
+
+# CORS (allow frontend)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # allow all for now
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -22,42 +22,36 @@ app.add_middleware(
 def root():
     return {"message": "Audio Denoising API is running"}
 
-
 @app.post("/denoise", response_class=FileResponse)
 async def denoise(file: UploadFile = File(...)):
 
-    input_filename = f"input_{uuid.uuid4()}.wav"
+    # Keep original extension (important for mp3/webm support)
+    ext = file.filename.split(".")[-1]
+
+    input_filename = f"input_{uuid.uuid4()}.{ext}"
     output_filename = f"output_{uuid.uuid4()}.wav"
 
     try:
-        # Save input file
+        # Save uploaded file
         with open(input_filename, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
 
-        # Process audio
-        cleaned_audio, sr = denoise_audio(input_filename)
+        # Run pipeline (this now SAVES file itself)
+        denoise_audio(input_filename, output_filename)
 
-        # Compute SNR (optional)
-        snr_value = estimate_snr(cleaned_audio)
-
-        print(f"SNR Estimate: {snr_value:.2f} dB")  # debug only
-
-        # Save output
-        sf.write(output_filename, cleaned_audio, sr)
-
-        # Return file
+        # Return cleaned file
         return FileResponse(
             output_filename,
             media_type="audio/wav",
             filename="cleaned.wav"
         )
-   
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
     finally:
-        # Cleanup (VERY IMPORTANT)
+        # Cleanup input file
         if os.path.exists(input_filename):
             os.remove(input_filename)
-            
 
+        # Optional: cleanup output after response (skip for now)

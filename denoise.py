@@ -1,94 +1,145 @@
-# denoise.py
-
 import numpy as np
 import librosa
-from scipy.signal import butter, lfilter
+import soundfile as sf
+from scipy.signal import butter, filtfilt
+import torch
+import torchaudio
 
+# =============================
+# CONFIG
+# =============================
 
-# -------------------------------
-# Bandpass Filter (Preprocessing)
-# -------------------------------
-def bandpass_filter(signal, sr, lowcut=80, highcut=7000, order=5):
-    nyquist = 0.5 * sr
-    low = lowcut / nyquist
-    high = highcut / nyquist
+SR = 16000
+FRAME_LENGTH = 1024
+HOP_LENGTH = 512
+LOWCUT = 100
+HIGHCUT = 6000
+ALPHA_DD = 0.98
+BETA = 1.1
+GAIN_FLOOR = 0.05
 
-    b, a = butter(order, [low, high], btype='band')
-    filtered = lfilter(b, a, signal)
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-    return filtered
+# =============================
+# LOAD MODEL (LOAD ONCE)
+# =============================
 
+bundle = torchaudio.pipelines.HDEMUCS_HIGH_MUSDB_PLUS
+dl_model = bundle.get_model().to(DEVICE)
+dl_model.eval()
 
-# --------------------------------------
-# Wiener Filter (Decision Directed)
-# --------------------------------------
-def wiener_filter(y, sr, noise_est_dur=0.4, alpha_dd=0.98,
-                  n_fft=2048, hop_length=512):
+# =============================
+# DSP FUNCTIONS (UNCHANGED)
+# =============================
 
-    # --- Noise estimation ---
-    n_noise = int(noise_est_dur * sr)
-    D_noise = librosa.stft(y[:n_noise], n_fft=n_fft, hop_length=hop_length)
-    noise_psd = np.mean(np.abs(D_noise)**2, axis=1)
+def bandpass_filter(signal, lowcut, highcut, sr, order=6):
+    nyq = 0.5 * sr
+    b, a = butter(order, [lowcut/nyq, highcut/nyq], btype='band')
+    return filtfilt(b, a, signal)
 
-    # --- STFT of full signal ---
-    D = librosa.stft(y, n_fft=n_fft, hop_length=hop_length)
-    F, T = D.shape
-    magnitude = np.abs(D)
-    phase = np.exp(1j * np.angle(D))
+def pre_emphasis(signal):
+    return np.append(signal[0], signal[1:] - 0.97 * signal[:-1])
 
-    # --- Initialization ---
+def compute_stft(signal):
+    return librosa.stft(signal, n_fft=FRAME_LENGTH,
+                        hop_length=HOP_LENGTH)
+
+def estimate_noise(signal):
+    energy = librosa.feature.rms(y=signal)[0]
+    threshold = np.percentile(energy, 20)
+
+    stft = compute_stft(signal)
+    mag = np.abs(stft)
+
+    noise_frames = energy < threshold
+    if np.sum(noise_frames) == 0:
+        noise_frames[:5] = True
+
+    noise_mag = mag[:, noise_frames]
+    noise_psd = np.mean(noise_mag, axis=1)**2 + 1e-10
+
+    return noise_psd
+
+def wiener_filter(mag, noise_psd):
+    F, T = mag.shape
     gain = np.ones((F, T))
-    prev_clean = magnitude[:, 0].copy()
+    prev = mag[:, 0]
 
-    # --- Frame-by-frame processing ---
-    for m in range(T):
-        # Posteriori SNR
-        snr_post = magnitude[:, m]**2 / (noise_psd + 1e-10) - 1
-        snr_post = np.maximum(snr_post, 0)
+    for t in range(T):
+        snr_post = np.maximum((mag[:, t]**2 / noise_psd) - 1, 0)
+        snr_prior = ALPHA_DD * (prev**2 / noise_psd) + (1-ALPHA_DD)*snr_post
+        gain[:, t] = snr_prior / (1 + snr_prior)
+        prev = gain[:, t] * mag[:, t]
 
-        # A priori SNR
-        snr_prior = alpha_dd * (prev_clean**2 / (noise_psd + 1e-10)) \
-                    + (1 - alpha_dd) * snr_post
+    return np.clip(gain, GAIN_FLOOR, 1)
 
-        # Wiener gain
-        gain[:, m] = snr_prior / (1.0 + snr_prior)
+def enhance(mag, gain, noise_psd):
+    clean = np.maximum(mag * gain - BETA*np.sqrt(noise_psd[:, None]), 0)
+    return np.maximum(clean, 0.02 * mag)
 
-        # Update previous clean estimate
-        prev_clean = gain[:, m] * magnitude[:, m]
+def reconstruct(mag, phase, length):
+    return librosa.istft(mag * phase, hop_length=HOP_LENGTH, length=length)
 
-    # --- Reconstruction ---
-    D_clean = gain * magnitude * phase
-    y_clean = librosa.istft(D_clean, hop_length=hop_length, length=len(y))
+# =============================
+# DEMUCS (UNCHANGED)
+# =============================
 
-    return y_clean
+def deep_learning_denoise(signal):
+    with torch.no_grad():
+        x = torch.tensor(signal, dtype=torch.float32)
 
+        x = x.unsqueeze(0).unsqueeze(0).repeat(1, 2, 1).to(DEVICE)
 
-# --------------------------------------
-# MAIN PIPELINE FUNCTION (IMPORTANT)
-# --------------------------------------
-def denoise_audio(file_path):
+        y = dl_model(x)
+
+        y = y[0]
+        y = y.mean(dim=0) * 0.8
+        y = y.cpu().numpy()
+
+    return y
+
+# =============================
+# MAIN PIPELINE
+# =============================
+
+def process_audio(signal):
+    signal = bandpass_filter(signal, LOWCUT, HIGHCUT, SR)
+    signal = pre_emphasis(signal)
+
+    noise_psd = estimate_noise(signal)
+
+    D = compute_stft(signal)
+    mag, phase = np.abs(D), np.exp(1j * np.angle(D))
+
+    gain = wiener_filter(mag, noise_psd)
+    mag = enhance(mag, gain, noise_psd)
+
+    output = reconstruct(mag, phase, len(signal))
+
+    # Deep Learning refinement
+    output = deep_learning_denoise(output)
+
+    output = np.nan_to_num(output)
+    output = np.clip(output, -1, 1).astype(np.float32)
+
+    return output
+
+# =============================
+# BACKEND FUNCTION (IMPORTANT)
+# =============================
+
+def denoise_audio(input_path, output_path):
     """
-    This is the ONLY function your backend will call.
-    Input: file path
-    Output: cleaned audio + sample rate
+    Backend entry point
     """
 
-    # Load audio
-    audio, sr = librosa.load(file_path, sr=None)
+    # Load ANY format (wav/mp3/etc.)
+    signal, sr = librosa.load(input_path, sr=SR)
 
-    # Preprocess
-    filtered_audio = bandpass_filter(audio, sr)
+    # Process
+    cleaned = process_audio(signal)
 
-    # Denoise
-    cleaned_audio = wiener_filter(filtered_audio, sr)
+    # Save as WAV
+    sf.write(output_path, cleaned, sr)
 
-    # Normalize (IMPORTANT for audio quality)
-    cleaned_audio = cleaned_audio / (np.max(np.abs(cleaned_audio)) + 1e-8)
-
-    return cleaned_audio, sr
-
-def estimate_snr(signal):
-    power_signal = np.mean(signal**2)
-    noise = signal - np.mean(signal)
-    power_noise = np.mean(noise**2)
-    return 10 * np.log10(power_signal / (power_noise + 1e-10))
+    return output_path
