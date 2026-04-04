@@ -2,8 +2,6 @@ import numpy as np
 import librosa
 import soundfile as sf
 from scipy.signal import butter, filtfilt
-import torch
-import torchaudio
 
 # =============================
 # CONFIG
@@ -18,26 +16,11 @@ ALPHA_DD = 0.98
 BETA = 1.1
 GAIN_FLOOR = 0.05
 
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+# Toggle Deep Learning (DISABLED for deployment)
+USE_DEEP_LEARNING = False
 
 # =============================
-# LOAD MODEL (LOAD ONCE)
-# =============================
-
-dl_model = None
-
-def get_model():
-    global dl_model
-
-    if dl_model is None:
-        bundle = torchaudio.pipelines.HDEMUCS_HIGH_MUSDB_PLUS
-        dl_model = bundle.get_model().to(DEVICE)
-        dl_model.eval()
-
-    return dl_model
-
-# =============================
-# DSP FUNCTIONS (UNCHANGED)
+# DSP FUNCTIONS
 # =============================
 
 def bandpass_filter(signal, lowcut, highcut, sr, order=6):
@@ -89,24 +72,12 @@ def reconstruct(mag, phase, length):
     return librosa.istft(mag * phase, hop_length=HOP_LENGTH, length=length)
 
 # =============================
-# DEMUCS (UNCHANGED)
+# OPTIONAL DEEP LEARNING (DISABLED)
 # =============================
 
 def deep_learning_denoise(signal):
-    model = get_model()
-
-    with torch.no_grad():
-        x = torch.tensor(signal, dtype=torch.float32)
-
-        x = x.unsqueeze(0).unsqueeze(0).repeat(1, 2, 1).to(DEVICE)
-
-        y = model(x)
-
-        y = y[0]
-        y = y.mean(dim=0) * 0.8
-        y = y.cpu().numpy()
-
-    return y
+    # Disabled version (safe fallback)
+    return signal
 
 # =============================
 # MAIN PIPELINE
@@ -126,8 +97,9 @@ def process_audio(signal):
 
     output = reconstruct(mag, phase, len(signal))
 
-    # Deep Learning refinement
-    output = deep_learning_denoise(output)
+    # Deep Learning refinement (currently OFF)
+    if USE_DEEP_LEARNING:
+        output = deep_learning_denoise(output)
 
     output = np.nan_to_num(output)
     output = np.clip(output, -1, 1).astype(np.float32)
@@ -143,13 +115,13 @@ def denoise_audio(input_path, output_path):
     Backend entry point
     """
 
-    # Load ANY format (wav/mp3/etc.)
+    # Load ANY format (wav/mp3/webm/etc.)
     signal, sr = librosa.load(input_path, sr=SR)
 
     # Process
     cleaned = process_audio(signal)
 
-    # Save as WAV
+    # Save output
     sf.write(output_path, cleaned, sr)
 
     return output_path
